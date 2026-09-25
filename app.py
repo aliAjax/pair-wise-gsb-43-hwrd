@@ -78,6 +78,7 @@ class ProcurementService:
                     status TEXT NOT NULL DEFAULT 'draft',
                     deadline TEXT NOT NULL,
                     criteria TEXT NOT NULL DEFAULT '[]',
+                    bond_required REAL NOT NULL DEFAULT 0,
                     evaluation_round INTEGER NOT NULL DEFAULT 1,
                     evaluations_locked INTEGER NOT NULL DEFAULT 0,
                     awarded_bid_id INTEGER,
@@ -154,6 +155,29 @@ class ProcurementService:
                     created_at TEXT NOT NULL,
                     resolved_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS bid_bonds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    paid_amount REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    settled_amount REAL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tender_id,vendor_id)
+                );
+                CREATE TABLE IF NOT EXISTS bond_transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bond_id INTEGER NOT NULL REFERENCES bid_bonds(id),
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    tx_type TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    operator TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER REFERENCES tenders(id),
@@ -164,8 +188,13 @@ class ProcurementService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_bond_tender ON bid_bonds(tender_id,status);
+                CREATE INDEX IF NOT EXISTS idx_bond_tx ON bond_transactions(bond_id,id);
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(tenders)").fetchall()}
+            if "bond_required" not in columns:
+                conn.execute("ALTER TABLE tenders ADD COLUMN bond_required REAL NOT NULL DEFAULT 0")
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -179,6 +208,35 @@ class ProcurementService:
         if not row:
             raise DomainError("采购项目不存在", 404)
         return row
+
+    def _bond_tx(self, conn: sqlite3.Connection, bond_id: int, tender_id: int,
+                 vendor_id: int, tx_type: str, amount: float, actor: str) -> None:
+        conn.execute(
+            "INSERT INTO bond_transactions(bond_id,tender_id,vendor_id,tx_type,amount,operator,created_at) VALUES(?,?,?,?,?,?,?)",
+            (bond_id, tender_id, vendor_id, tx_type, amount, actor, utcnow()),
+        )
+
+    def _bond_view(self, conn: sqlite3.Connection, bond: sqlite3.Row) -> dict[str, Any]:
+        item = dict(bond)
+        item["transactions"] = [dict(r) for r in conn.execute(
+            "SELECT id,tx_type,amount,operator,created_at FROM bond_transactions WHERE bond_id=? ORDER BY id",
+            (bond["id"],),
+        ).fetchall()]
+        return item
+
+    def _get_or_create_bond(self, conn: sqlite3.Connection, tender_id: int,
+                            vendor_id: int, actor: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM bid_bonds WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)
+        ).fetchone()
+        if row:
+            return row
+        now = utcnow()
+        cur = conn.execute(
+            "INSERT INTO bid_bonds(tender_id,vendor_id,created_by,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (tender_id, vendor_id, actor, now, now),
+        )
+        return conn.execute("SELECT * FROM bid_bonds WHERE id=?", (cur.lastrowid,)).fetchone()
 
     def create_vendor(self, actor: str, role: str, vendor_no: str, name: str,
                       representative: str) -> dict[str, Any]:
@@ -198,12 +256,19 @@ class ProcurementService:
             return dict(conn.execute("SELECT * FROM vendors WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def create_tender(self, actor: str, role: str, tender_no: str, title: str,
-                      deadline: str, criteria: list[dict[str, Any]], description: str = "") -> dict[str, Any]:
+                      deadline: str, criteria: list[dict[str, Any]], description: str = "",
+                      bond_required: float = 0) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"procurement"}, "创建采购项目")
         parse_time(deadline)
         if not tender_no.strip() or not title.strip():
             raise DomainError("项目编号和标题不能为空")
+        try:
+            bond_required = float(bond_required)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("投标保证金必须是数值") from exc
+        if bond_required < 0:
+            raise DomainError("投标保证金不能为负数")
         normalized_criteria = []
         total_weight = Decimal("0")
         for item in criteria:
@@ -227,10 +292,10 @@ class ProcurementService:
         with self.connect() as conn:
             try:
                 cur = conn.execute(
-                    """INSERT INTO tenders(tender_no,title,description,deadline,criteria,created_by,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO tenders(tender_no,title,description,deadline,criteria,bond_required,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
                     (tender_no.strip(), title.strip(), description.strip(), parse_time(deadline).isoformat(timespec="seconds"),
-                     json.dumps(normalized_criteria, ensure_ascii=False), actor, utcnow(), utcnow()),
+                     json.dumps(normalized_criteria, ensure_ascii=False), bond_required, actor, utcnow(), utcnow()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("项目编号已存在", 409) from exc
@@ -250,6 +315,103 @@ class ProcurementService:
             conn.execute("UPDATE tenders SET status='published',version=version+1,updated_at=? WHERE id=?", (utcnow(), tender_id))
             self._audit(conn, tender_id, actor, "tender.published", {"deadline": tender["deadline"]})
             return dict(self._tender(conn, tender_id))
+
+    def deposit_bond(self, actor: str, role: str, tender_id: int, vendor_id: int,
+                     amount: float) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "缴纳投标保证金")
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("保证金金额必须是数值") from exc
+        if amount <= 0:
+            raise DomainError("保证金金额必须大于0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] != "published":
+                raise DomainError("项目开标后保证金已锁死，不能缴纳或补缴", 409)
+            vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+            if not vendor:
+                raise DomainError("供应商不存在", 404)
+            bond = self._get_or_create_bond(conn, tender_id, vendor_id, actor)
+            if bond["status"] != "active":
+                raise DomainError("项目开标后保证金已锁死，不能缴纳或补缴", 409)
+            now = utcnow()
+            paid = round(float(bond["paid_amount"]) + amount, 2)
+            conn.execute(
+                "UPDATE bid_bonds SET paid_amount=?,version=version+1,updated_at=? WHERE id=?",
+                (paid, now, bond["id"]),
+            )
+            self._bond_tx(conn, bond["id"], tender_id, vendor_id, "deposit", amount, actor)
+            self._audit(conn, tender_id, actor, "bond.deposited",
+                        {"vendor_id": vendor_id, "amount": amount, "paid_amount": paid,
+                         "bond_required": tender["bond_required"]})
+            return self._bond_view(conn, conn.execute("SELECT * FROM bid_bonds WHERE id=?", (bond["id"],)).fetchone())
+
+    def refund_bond(self, actor: str, role: str, tender_id: int, vendor_id: int,
+                    amount: float | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "申请退回投标保证金")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] != "published":
+                raise DomainError("开标后保证金已锁死，不能申请退回", 409)
+            if not conn.execute("SELECT 1 FROM vendors WHERE id=?", (vendor_id,)).fetchone():
+                raise DomainError("供应商不存在", 404)
+            bond = conn.execute(
+                "SELECT * FROM bid_bonds WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)
+            ).fetchone()
+            if not bond:
+                raise DomainError("该供应商尚未缴纳保证金", 404)
+            if bond["status"] != "active":
+                raise DomainError("开标后保证金已锁死，不能申请退回", 409)
+            paid = float(bond["paid_amount"])
+            if amount is None:
+                amount = paid
+            else:
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError) as exc:
+                    raise DomainError("退回金额必须是数值") from exc
+            if amount <= 0:
+                raise DomainError("退回金额必须大于0")
+            if amount > paid:
+                raise DomainError("退回金额不能超过已缴保证金", 409)
+            active_bid = conn.execute(
+                "SELECT 1 FROM bids WHERE tender_id=? AND vendor_id=? AND status='sealed'",
+                (tender_id, vendor_id),
+            ).fetchone()
+            if active_bid:
+                raise DomainError("仍有未撤回的投标，不能退回保证金，请先撤回投标", 409)
+            remaining = round(paid - amount, 2)
+            now = utcnow()
+            conn.execute(
+                "UPDATE bid_bonds SET paid_amount=?,version=version+1,updated_at=? WHERE id=?",
+                (remaining, now, bond["id"]),
+            )
+            self._bond_tx(conn, bond["id"], tender_id, vendor_id, "refund", amount, actor)
+            self._audit(conn, tender_id, actor, "bond.refunded",
+                        {"vendor_id": vendor_id, "amount": amount, "paid_amount": remaining})
+            return self._bond_view(conn, conn.execute("SELECT * FROM bid_bonds WHERE id=?", (bond["id"],)).fetchone())
+
+    def list_bonds(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor", "procurement", "supervisor", "evaluator", "auditor"}, "查询保证金")
+        with self.connect() as conn:
+            tender = self._tender(conn, tender_id)
+            if role == "vendor":
+                rows = conn.execute(
+                    "SELECT * FROM bid_bonds WHERE tender_id=? AND created_by=? ORDER BY id",
+                    (tender_id, actor),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM bid_bonds WHERE tender_id=? ORDER BY id", (tender_id,)
+                ).fetchall()
+            return {"tender_id": tender_id, "bond_required": tender["bond_required"],
+                    "status": tender["status"], "bonds": [self._bond_view(conn, row) for row in rows]}
 
     def submit_bid(self, actor: str, role: str, tender_id: int, vendor_id: int,
                    payload: dict[str, Any], price: float, expected_version: int | None = None) -> dict[str, Any]:
@@ -273,6 +435,15 @@ class ProcurementService:
             vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
             if not vendor:
                 raise DomainError("供应商不存在", 404)
+            bond = conn.execute(
+                "SELECT * FROM bid_bonds WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)
+            ).fetchone()
+            paid_amount = float(bond["paid_amount"]) if bond else 0.0
+            if paid_amount < float(tender["bond_required"]):
+                raise DomainError(
+                    "投标保证金不足，应缴 %.2f，实缴 %.2f，不能递标"
+                    % (float(tender["bond_required"]), paid_amount), 402,
+                )
             if not conn.execute("SELECT 1 FROM conflicts WHERE tender_id=? AND vendor_id=? AND evaluator=?", (tender_id, vendor_id, actor)).fetchone():
                 pass
             existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
@@ -335,15 +506,26 @@ class ProcurementService:
                 raise DomainError("尚未到开标时间", 409)
             rows = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status='sealed' ORDER BY id", (tender_id,)).fetchall()
             opened = []
+            locked_bonds = []
             now = utcnow()
             for row in rows:
                 digest = canonical_hash(json.loads(row["payload"]))
                 if digest != row["payload_hash"]:
                     raise DomainError("投标完整性校验失败: %s" % row["id"], 409)
+                bond = conn.execute(
+                    "SELECT * FROM bid_bonds WHERE tender_id=? AND vendor_id=?", (tender_id, row["vendor_id"])
+                ).fetchone()
+                if not bond or bond["status"] != "active" or float(bond["paid_amount"]) < float(tender["bond_required"]):
+                    raise DomainError("供应商保证金未足额锁定，不能开标: %s" % row["vendor_id"], 409)
+                conn.execute(
+                    "UPDATE bid_bonds SET status='locked',version=version+1,updated_at=? WHERE id=?",
+                    (now, bond["id"]),
+                )
+                locked_bonds.append({"vendor_id": row["vendor_id"], "amount": bond["paid_amount"]})
                 conn.execute("UPDATE bids SET status='opened',opened_at=?,version=version+1 WHERE id=?", (now, row["id"]))
                 opened.append(dict(conn.execute("SELECT * FROM bids WHERE id=?", (row["id"],)).fetchone()))
             conn.execute("UPDATE tenders SET status='opened',version=version+1,updated_at=? WHERE id=?", (now, tender_id))
-            self._audit(conn, tender_id, actor, "tender.opened", {"bid_count": len(opened)})
+            self._audit(conn, tender_id, actor, "tender.opened", {"bid_count": len(opened), "locked_bonds": locked_bonds})
             return {"tender": dict(self._tender(conn, tender_id)), "bids": opened}
 
     def declare_conflict(self, actor: str, role: str, tender_id: int, evaluator: str,
@@ -514,6 +696,40 @@ class ProcurementService:
             self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {"complaint_id": complaint_id, "decision": decision})
             return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
 
+    def _settle_bonds(self, conn: sqlite3.Connection, tender_id: int,
+                      winner_vendor_id: int, actor: str) -> list[dict[str, Any]]:
+        """授标后按结果结算：中标转履约、废标没收、其余原路退还。"""
+        disqualified = {
+            row["vendor_id"]
+            for row in conn.execute(
+                "SELECT vendor_id FROM bids WHERE tender_id=? AND status='disqualified'", (tender_id,)
+            ).fetchall()
+        }
+        bonds = conn.execute(
+            "SELECT * FROM bid_bonds WHERE tender_id=? AND status IN ('locked','active') ORDER BY id",
+            (tender_id,),
+        ).fetchall()
+        settlement = []
+        now = utcnow()
+        for bond in bonds:
+            amount = round(float(bond["paid_amount"]), 2)
+            if bond["vendor_id"] == winner_vendor_id:
+                new_status, tx_type, label = "converted", "convert", "转为履约保证金"
+            elif bond["vendor_id"] in disqualified:
+                new_status, tx_type, label = "forfeited", "forfeit", "废标没收"
+            else:
+                new_status, tx_type, label = "returned", "return", "原路退还"
+            conn.execute(
+                "UPDATE bid_bonds SET status=?,settled_amount=?,version=version+1,updated_at=? WHERE id=?",
+                (new_status, amount, now, bond["id"]),
+            )
+            if amount > 0:
+                self._bond_tx(conn, bond["id"], tender_id, bond["vendor_id"], tx_type, amount, actor)
+            item = {"vendor_id": bond["vendor_id"], "amount": amount, "outcome": new_status, "label": label}
+            settlement.append(item)
+            self._audit(conn, tender_id, actor, "bond.settled", item)
+        return settlement
+
     def award_tender(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "授标")
@@ -547,14 +763,17 @@ class ProcurementService:
                 raise DomainError("没有可授标的有效投标", 409)
             ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            bond_settlement = self._settle_bonds(conn, tender_id, winner["vendor_id"], actor)
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner,
+                        "bond_settlement": bond_settlement, "awarded_by": actor, "awarded_at": utcnow()}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
                 (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
             )
             conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
             self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
-            return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
+            return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot,
+                    "bond_settlement": bond_settlement}
 
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
@@ -582,12 +801,24 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            if role == "vendor":
+                bond_rows = conn.execute(
+                    "SELECT * FROM bid_bonds WHERE tender_id=? AND created_by=? ORDER BY id",
+                    (tender_id, actor),
+                ).fetchall()
+            elif role in {"procurement", "supervisor", "auditor"}:
+                bond_rows = conn.execute(
+                    "SELECT * FROM bid_bonds WHERE tender_id=? ORDER BY id", (tender_id,)
+                ).fetchall()
+            else:
+                bond_rows = []
+            bonds = [self._bond_view(conn, row) for row in bond_rows]
+            return {"tender": tender, "bids": bids, "clarifications": clarifications, "bonds": bonds}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
             tenders = [dict(r) for r in conn.execute(
-                "SELECT id,tender_no,title,description,status,deadline,evaluation_round,version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
+                "SELECT id,tender_no,title,description,status,deadline,bond_required,evaluation_round,version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
             ).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
             if role in {"procurement", "supervisor", "auditor"}:
@@ -626,8 +857,10 @@ class ProcurementService:
             "proc-demo", "procurement", "TENDER-DEMO", "服务器采购", deadline,
             [{"name": "价格", "weight": 60, "kind": "cost", "max_value": 1000000},
              {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100}],
+            bond_required=20000,
         )
         published = self.publish_tender("proc-demo", "procurement", tender["id"], tender["version"])
+        self.deposit_bond("vendor-demo", "vendor", tender["id"], vendor["id"], 20000)
         self.submit_bid("vendor-demo", "vendor", tender["id"], vendor["id"], {"价格": 900000, "质量": 90}, 900000)
         return {"seeded": True, "tender_id": tender["id"], "vendor_id": vendor["id"], "published_version": published["version"]}
 
@@ -677,7 +910,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
             elif path.startswith("/api/tenders/"):
-                self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
+                parts = path.split("/")
+                if len(parts) == 5 and parts[4] == "bonds":
+                    self._send(200, self.service.list_bonds(actor, role, int(parts[3])))
+                else:
+                    self._send(200, self.service.get_tender(actor, role, int(parts[3])))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -696,6 +933,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.publish_tender(actor, role, **data)
             elif path == "/api/bids":
                 result = self.service.submit_bid(actor, role, **data)
+            elif path == "/api/bonds/deposit":
+                result = self.service.deposit_bond(actor, role, **data)
+            elif path == "/api/bonds/refund":
+                result = self.service.refund_bond(actor, role, **data)
             elif path == "/api/bids/withdraw":
                 result = self.service.withdraw_bid(actor, role, **data)
             elif path == "/api/tenders/open":

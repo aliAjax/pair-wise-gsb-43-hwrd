@@ -20,14 +20,19 @@ class ProcurementFlowTest(unittest.TestCase):
             {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100},
         ]
         self.tender = self.service.create_tender(
-            "proc1", "procurement", "T-001", "数据中心设备", (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat(), criteria
+            "proc1", "procurement", "T-001", "数据中心设备", (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat(),
+            criteria, bond_required=50000,
         )
         self.tender = self.service.publish_tender("proc1", "procurement", self.tender["id"], self.tender["version"])
 
     def tearDown(self):
         self.tmp.cleanup()
 
+    def fund(self, vendor, actor, amount=50000):
+        return self.service.deposit_bond(actor, "vendor", self.tender["id"], vendor["id"], amount)
+
     def bid(self, vendor, actor, number, price, quality):
+        self.fund(vendor, actor)
         return self.service.submit_bid(actor, "vendor", self.tender["id"], vendor["id"], {"报价": price, "质量": quality}, price)
 
     def test_complete_sealed_bid_open_evaluate_and_award_flow(self):
@@ -78,6 +83,98 @@ class ProcurementFlowTest(unittest.TestCase):
         with self.assertRaises(DomainError) as ctx:
             self.service.open_bids("vendor1", "vendor", self.tender["id"], updated["version"])
         self.assertEqual(403, ctx.exception.status)
+
+
+class BidBondTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.service = ProcurementService(Path(self.tmp.name) / "test_bond.db")
+        self.vendor1 = self.service.create_vendor("proc1", "procurement", "V-101", "启明科技", "v1")
+        self.vendor2 = self.service.create_vendor("proc1", "procurement", "V-102", "远山系统", "v2")
+        self.vendor3 = self.service.create_vendor("proc1", "procurement", "V-103", "云岚网络", "v3")
+        criteria = [
+            {"name": "报价", "weight": 60, "kind": "cost", "max_value": 1000000},
+            {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100},
+        ]
+        self.tender = self.service.create_tender(
+            "proc1", "procurement", "T-BOND", "网络设备",
+            (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat(),
+            criteria, bond_required=50000,
+        )
+        self.tender = self.service.publish_tender("proc1", "procurement", self.tender["id"], self.tender["version"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def bid(self, vendor, actor, price, quality):
+        return self.service.submit_bid(actor, "vendor", self.tender["id"], vendor["id"],
+                                       {"报价": price, "质量": quality}, price)
+
+    def test_insufficient_bond_blocks_submission_and_topup_allows_it(self):
+        with self.assertRaises(DomainError) as ctx:
+            self.bid(self.vendor1, "v1", 800000, 90)
+        self.assertEqual(402, ctx.exception.status)
+        bond = self.service.deposit_bond("v1", "vendor", self.tender["id"], self.vendor1["id"], 40000)
+        self.assertEqual(40000, bond["paid_amount"])
+        with self.assertRaises(DomainError):
+            self.bid(self.vendor1, "v1", 800000, 90)
+        bond = self.service.deposit_bond("v1", "vendor", self.tender["id"], self.vendor1["id"], 10000)
+        self.assertEqual(50000, bond["paid_amount"])
+        self.bid(self.vendor1, "v1", 800000, 90)
+        # 有未撤回投标时不能退回
+        with self.assertRaises(DomainError):
+            self.service.refund_bond("v1", "vendor", self.tender["id"], self.vendor1["id"])
+
+    def test_refund_before_open_and_lock_after_open(self):
+        bond = self.service.deposit_bond("v2", "vendor", self.tender["id"], self.vendor2["id"], 50000)
+        self.assertEqual("active", bond["status"])
+        # 未投标的供应商开标前可申请退回（默认全额）
+        bond = self.service.refund_bond("v2", "vendor", self.tender["id"], self.vendor2["id"])
+        self.assertEqual(0, bond["paid_amount"])
+        self.assertEqual("refund", bond["transactions"][-1]["tx_type"])
+        # 重新缴纳、投标，开标后保证金锁死
+        self.service.deposit_bond("v2", "vendor", self.tender["id"], self.vendor2["id"], 50000)
+        self.bid(self.vendor2, "v2", 700000, 80)
+        time.sleep(2.1)
+        self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
+        with self.assertRaises(DomainError) as deposit_ctx:
+            self.service.deposit_bond("v2", "vendor", self.tender["id"], self.vendor2["id"], 1)
+        self.assertEqual(409, deposit_ctx.exception.status)
+        with self.assertRaises(DomainError) as refund_ctx:
+            self.service.refund_bond("v2", "vendor", self.tender["id"], self.vendor2["id"])
+        self.assertEqual(409, refund_ctx.exception.status)
+
+    def test_award_settles_bonds_by_outcome(self):
+        self.service.deposit_bond("v1", "vendor", self.tender["id"], self.vendor1["id"], 50000)
+        self.service.deposit_bond("v2", "vendor", self.tender["id"], self.vendor2["id"], 50000)
+        self.service.deposit_bond("v3", "vendor", self.tender["id"], self.vendor3["id"], 50000)
+        bid1 = self.bid(self.vendor1, "v1", 800000, 90)
+        bid2 = self.bid(self.vendor2, "v2", 700000, 80)
+        bid3 = self.bid(self.vendor3, "v3", 750000, 85)
+        time.sleep(2.1)
+        opened = self.service.open_bids("proc1", "procurement", self.tender["id"], self.tender["version"])
+        self.assertEqual(3, len(opened["bids"]))
+        self.service.disqualify_bid("proc1", "procurement", bid2["id"], "资质不符", 2)
+        self.service.evaluate_bid("eval1", "evaluator", bid1["id"], {"报价": 800000, "质量": 90})
+        self.service.evaluate_bid("eval1", "evaluator", bid3["id"], {"报价": 750000, "质量": 85})
+        current = self.service.get_tender("sup1", "supervisor", self.tender["id"])
+        award = self.service.award_tender("sup1", "supervisor", self.tender["id"], current["tender"]["version"])
+        outcomes = {item["vendor_id"]: item["outcome"] for item in award["bond_settlement"]}
+        self.assertEqual("converted", outcomes[self.vendor1["id"]])  # 中标转履约保证金
+        self.assertEqual("forfeited", outcomes[self.vendor2["id"]])  # 废标没收
+        self.assertEqual("returned", outcomes[self.vendor3["id"]])   # 其余原路退还
+        bonds = {row["vendor_id"]: row for row in
+                 self.service.list_bonds("proc1", "procurement", self.tender["id"])["bonds"]}
+        self.assertEqual("converted", bonds[self.vendor1["id"]]["status"])
+        self.assertEqual(50000, bonds[self.vendor1["id"]]["settled_amount"])
+        self.assertEqual("forfeited", bonds[self.vendor2["id"]]["status"])
+        self.assertEqual("returned", bonds[self.vendor3["id"]]["status"])
+        # 授标后一切已定，不能再动保证金
+        with self.assertRaises(DomainError):
+            self.service.deposit_bond("v3", "vendor", self.tender["id"], self.vendor3["id"], 1)
+        with self.assertRaises(DomainError):
+            self.service.refund_bond("v3", "vendor", self.tender["id"], self.vendor3["id"])
+        self.assertIn("bond_settlement", award["award"])
 
 
 if __name__ == "__main__":
